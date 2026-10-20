@@ -172,6 +172,9 @@ The same description tells the model that it must close the GOAL itself
 before ending a turn. That text is visible in every session where I am
 loaded, not only in sessions that use GOALs.
 
+The description is a reminder, not an enforcement: I never make the agent
+create a GOAL. If a GOAL must exist for a task, say so in the prompt.
+
 My nudge goes through `ctx.session.prompt`, so it lands in the transcript as
 a user message. The wording matters, so I keep the essence here: it opens
 with `GOAL watchdog:`, says "keep going instead of waiting for a human",
