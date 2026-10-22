@@ -427,7 +427,7 @@ function lastUserText(msgs: unknown): string {
   return ""
 }
 
-const ACTIVE_WINDOW_MS = 3 * 60 * 1000
+const ACTIVE_WINDOW_MS = 10 * 60 * 1000
 // I treat these markers as my own messages: "goal watchdog" is mine, and
 // "auto retry" comes from another plugin of mine that also injects prompts;
 // neither should count as a human speaking or as a child report.
