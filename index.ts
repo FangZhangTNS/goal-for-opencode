@@ -1,5 +1,7 @@
 import { Plugin } from "@opencode/plugin"
 
+import { DEFAULT_EVERY_MS, formatEvery, parseNudgeEvery, resolveCooldownMs } from "./nudge"
+
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -14,17 +16,21 @@ import { join } from "node:path"
 // The four stop rules I accept are done / need_human_decision /
 // need_human_action / blocked (with evidence).
 //
+// I nudge a session at most once per ten minutes. The agent can stretch that per
+// session with the nudgeEvery argument (1m..24h) or switch it off for a wait that
+// something outside me will end. An override lives only while at least one GOAL
+// is open, so a later GOAL in the same session cannot inherit an off switch.
+//
 // I store state in ~/.config/opencode/goal-for-opencode-sessions/<sessionID>.json
 // I expose that file only through the `goal` tool below.
 // Free-form fields (target, doneCriteria, plan, evidence) accept any language;
 // I keep the tool definition itself English-only.
 
-const VERSION = "1.0.5"
+const VERSION = "1.1.0"
 const LOG = "goal-for-opencode-debug.log"
 const SESSIONS_DIRNAME = "goal-for-opencode-sessions"
 const SCAN_INTERVAL_MS = 60000
 const MIN_SCAN_GAP_MS = 15000
-const NUDGE_COOLDOWN_MS = 10 * 60 * 1000
 const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000
 const RECENT_WINDOW = 10
 
@@ -50,6 +56,10 @@ interface GoalFile {
   pendingChildIDs?: string[]
   digestSince?: number | null
   nudgeStreak?: number
+  // null = default ten minutes, 0 = off, positive = cooldown in ms
+  nudgeEveryMs?: number | null
+  // When I switched the throttle off, so `list` can show how long it has been off.
+  nudgeOffAt?: number | null
   goals?: Goal[]
 }
 
@@ -250,6 +260,10 @@ function loadOrInit(sessionID: string): { path: string; gf: GoalFile } | null {
   const gf: GoalFile = existing ?? { version: 1, sessionID, goals: [], pendingChildIDs: [], lastNudgeAt: 0 }
   if (!Array.isArray(gf.goals)) gf.goals = []
   if (!Array.isArray(gf.pendingChildIDs)) gf.pendingChildIDs = []
+  // A hand-edited or half-written value must read as "no override", never as
+  // off: the fallback is the ten-minute default, which is the safe direction.
+  if (typeof gf.nudgeEveryMs !== "number") gf.nudgeEveryMs = null
+  if (typeof gf.nudgeOffAt !== "number") gf.nudgeOffAt = null
   return { path, gf }
 }
 
@@ -304,13 +318,15 @@ function saveGoalFile(path: string, gf: GoalFile): void {
 // My scan owns only digestSince/lastNudgeAt, so I merge those two fields into
 // the freshest copy; a goal-tool write landing mid-scan stays untouched. All
 // errors are swallowed: a failed merge costs one grace window at most.
-function mergeWriteScanState(path: string, patch: { digestSince?: number | null; lastNudgeAt?: number; nudgeStreak?: number }): void {
+function mergeWriteScanState(path: string, patch: { digestSince?: number | null; lastNudgeAt?: number; nudgeStreak?: number; nudgeEveryMs?: number | null; nudgeOffAt?: number | null }): void {
   try {
     const fresh = loadGoalFile(path)
     if (!fresh) return
     if ("digestSince" in patch) fresh.digestSince = patch.digestSince ?? null
     if (typeof patch.lastNudgeAt === "number") fresh.lastNudgeAt = patch.lastNudgeAt
     if (typeof patch.nudgeStreak === "number") fresh.nudgeStreak = patch.nudgeStreak
+    if ("nudgeEveryMs" in patch) fresh.nudgeEveryMs = patch.nudgeEveryMs ?? null
+    if ("nudgeOffAt" in patch) fresh.nudgeOffAt = patch.nudgeOffAt ?? null
     fresh.updatedAt = new Date().toISOString()
     writeFileAtomic(path, JSON.stringify(fresh, null, 2))
   } catch {}
@@ -319,6 +335,14 @@ function mergeWriteScanState(path: string, patch: { digestSince?: number | null;
 function openGoals(gf: GoalFile): Goal[] {
   if (!Array.isArray(gf.goals)) return []
   return gf.goals.filter((g) => g && g.status !== "done" && typeof g.target === "string" && g.target.length > 0)
+}
+
+// One sentence about the throttle, appended to tool replies so the caller sees
+// the current setting without a second list call. Silence when there is no
+// override, because the default needs no announcement.
+function throttleNote(every: unknown): string {
+  if (typeof every !== "number") return ""
+  return every === 0 ? " Nudges off for this session." : ` Nudges throttled to one per ${formatEvery(every)}.`
 }
 
 function toArray(msgs: unknown): unknown[] {
@@ -536,12 +560,16 @@ const GOAL_TOOL_INPUT = {
   properties: {
     action: {
       type: "string",
-      enum: ["create", "list", "done", "set_children"],
-      description: "create: open a new GOAL. list: show open GOALs. done: close a GOAL with a stop reason. set_children: replace pendingChildIDs.",
+      enum: ["create", "list", "done", "set_children", "set_nudge"],
+      description: "create: open a new GOAL. list: show open GOALs and the current nudge throttle. done: close a GOAL with a stop reason. set_children: replace pendingChildIDs. set_nudge: set the per-session nudge throttle.",
     },
     target: { type: "string", description: "Goal objective, any language. Required for create." },
     doneCriteria: { type: "string", description: "What counts as achieved, any language. Optional for create." },
     plan: { type: "string", description: "PLAN summary / todo list of the concrete steps to reach the GOAL, any language. Recommended on create." },
+    nudgeEvery: {
+      type: "string",
+      description: "Optional per-session nudge throttle: 30m, 1h, 1h30m, 90s, a bare number of minutes, off to stop nudges for this session, or default to clear an override. Range 1m..24h. Pass it when the task will idle for hours instead of closing the GOAL; use off only when something outside this plugin will wake the session, because nothing here will.",
+    },
     id: { type: "string", description: "GOAL id such as g1. Required for done." },
     doneReason: {
       type: "string",
@@ -564,7 +592,7 @@ export default Plugin.define({
     const cx = ctx as unknown as { session: SessionCtx }
     ensureSessionsDir()
     ensureStateDirs()
-    debugLogLine(`[INIT] goal-for-opencode v${VERSION} loaded. scan=60s cooldown=10min/session`)
+    debugLogLine(`[INIT] goal-for-opencode v${VERSION} loaded. scan=60s cooldown=${formatEvery(DEFAULT_EVERY_MS)} default, per-session override 1m..24h or off`)
 
     // I declare these before registering any hook: my callbacks must never run
     // inside their temporal dead zone.
@@ -608,7 +636,7 @@ export default Plugin.define({
       await ctx.tool.transform(async (editor) => {
         editor.add({
           name: "goal",
-          description: "GOAL tracker for long tasks. The main agent sets its own GOALs and closes them itself; I never close a GOAL. Actions: create opens a GOAL with target and an optional plan; list shows open GOALs; done closes a GOAL with a stop reason (done, need_human_decision, need_human_action, blocked with evidence); set_children replaces pendingChildIDs after dispatching or reaping subagents. On create, also write a short PLAN summary (a todo list of the concrete steps) into the plan field. While any GOAL is open the session is not finished: never go idle with nothing pending. If any of the four stop conditions holds (done, need_human_decision, need_human_action, blocked), you must close the GOAL yourself with action done and the matching doneReason before ending the turn. I only prompt; I never close anything.",
+          description: "GOAL tracker for long tasks. The main agent sets its own GOALs and closes them itself; I never close a GOAL. Actions: create opens a GOAL with target and an optional plan; list shows open GOALs; done closes a GOAL with a stop reason (done, need_human_decision, need_human_action, blocked with evidence); set_children replaces pendingChildIDs after dispatching or reaping subagents; set_nudge changes how often I may nudge this session. On create, also write a short PLAN summary (a todo list of the concrete steps) into the plan field. While any GOAL is open the session is not finished: never go idle with nothing pending. When the task is expected to idle for a long time (a multi-hour transfer, build or polling wait), pass nudgeEvery such as 2h so the reminder slows down while the GOAL stays open and tracked; closing the GOAL to stop the reminders loses the tracking. If any of the four stop conditions holds (done, need_human_decision, need_human_action, blocked), you must close the GOAL yourself with action done and the matching doneReason before ending the turn. I only prompt; I never close anything.",
           input: GOAL_TOOL_INPUT,
           execute: async (input, context) => {
             const args = (input ?? {}) as Record<string, unknown>
@@ -624,16 +652,32 @@ export default Plugin.define({
               if (!target) throw new Error("create requires target")
               const doneCriteria = typeof args["doneCriteria"] === "string" ? (args["doneCriteria"] as string) : ""
               const plan = typeof args["plan"] === "string" ? (args["plan"] as string).trim() : ""
+              // Absent means "leave the session throttle alone": a second GOAL in
+              // the same session must not silently reset a frequency the caller
+              // set for the whole task.
+              const everyRaw = args["nudgeEvery"]
+              const every = everyRaw === undefined ? undefined : parseNudgeEvery(everyRaw)
               const id = `g${gf.goals.length + 1}`
               const now = new Date().toISOString()
               gf.goals.push({ id, target, doneCriteria, plan, status: "open", createdAt: now, updatedAt: now })
+              if (every !== undefined) {
+                gf.nudgeEveryMs = every
+                gf.nudgeOffAt = every === 0 ? Date.now() : null
+                if (every === 0) debugLogLine(`[NUDGE-OFF] ${sessionID} set by create`)
+              }
               saveGoalFile(path, gf)
-              return { content: `GOAL ${id} opened. ${openGoals(gf).length} open in session ${sessionID}.` }
+              return { content: `GOAL ${id} opened. ${openGoals(gf).length} open in session ${sessionID}.${throttleNote(every === undefined ? gf.nudgeEveryMs : every)}` }
             }
             if (action === "list") {
               const open = openGoals(gf)
-              if (open.length === 0) return { content: "No open GOALs." }
-              return { content: open.map((g) => `[${g.id ?? "?"}] ${g.target ?? ""}${g.doneCriteria ? ` (done when: ${g.doneCriteria})` : ""}${g.plan ? `\n  plan: ${g.plan}` : ""}`).join("\n") }
+              const every = typeof gf.nudgeEveryMs === "number" ? gf.nudgeEveryMs : null
+              const state = every === null
+                ? ""
+                : every === 0
+                  ? `Nudges off${typeof gf.nudgeOffAt === "number" ? ` since ${new Date(gf.nudgeOffAt).toISOString()}` : ""}.\n`
+                  : `Nudges throttled to one per ${formatEvery(every)}.\n`
+              if (open.length === 0) return { content: `${state}No open GOALs.` }
+              return { content: state + open.map((g) => `[${g.id ?? "?"}] ${g.target ?? ""}${g.doneCriteria ? ` (done when: ${g.doneCriteria})` : ""}${g.plan ? `\n  plan: ${g.plan}` : ""}`).join("\n") }
             }
             if (action === "done") {
               const id = typeof args["id"] === "string" ? (args["id"] as string) : ""
@@ -660,7 +704,20 @@ export default Plugin.define({
               saveGoalFile(path, gf)
               return { content: `pendingChildIDs updated: ${(ids as string[]).length} outstanding.` }
             }
-            throw new Error("unknown action: use create, list, done, set_children")
+            if (action === "set_nudge") {
+              if (!("nudgeEvery" in args) || args["nudgeEvery"] === undefined) throw new Error("set_nudge requires nudgeEvery: for example 1h, 90m, off, default")
+              const every = parseNudgeEvery(args["nudgeEvery"])
+              gf.nudgeEveryMs = every
+              gf.nudgeOffAt = every === 0 ? Date.now() : null
+              saveGoalFile(path, gf)
+              if (every === 0) {
+                debugLogLine(`[NUDGE-OFF] ${sessionID} set by tool`)
+                return { content: `Nudges off for session ${sessionID}. Nothing in this plugin will wake it; only an outside event or a human message will.` }
+              }
+              if (every === null) return { content: `Session ${sessionID}: nudge override cleared, back to the default one per ${formatEvery(DEFAULT_EVERY_MS)}.` }
+              return { content: `Session ${sessionID}: nudges throttled to one per ${formatEvery(every)}.` }
+            }
+            throw new Error("unknown action: use create, list, done, set_children, set_nudge")
           },
         })
       })
@@ -872,6 +929,10 @@ async function checkLiveness(sessionID: string): Promise<Liveness> {
             // A leftover digest marker would skip the grace window of the
             // session's next GOAL, so I clear it while the file is quiet.
             if (gf.digestSince) mergeWriteScanState(path, { digestSince: null })
+            // The throttle belongs to the open-GOAL period. Clearing it here
+            // keeps a later GOAL in the same session from inheriting an off
+            // switch that was set for a finished task.
+            if (typeof gf.nudgeEveryMs === "number") mergeWriteScanState(path, { nudgeEveryMs: null, nudgeOffAt: null })
             try {
               if (preMtime > 0 && Date.now() - preMtime > PRUNE_AFTER_MS) {
                 unlinkSync(path)
@@ -883,7 +944,21 @@ async function checkLiveness(sessionID: string): Promise<Liveness> {
             continue
           }
           const lastNudge = typeof gf.lastNudgeAt === "number" ? gf.lastNudgeAt : 0
-          if (Date.now() - lastNudge < NUDGE_COOLDOWN_MS) continue
+          // A null cooldown means off. I stay out of that session, but the file
+          // maintenance above still runs, so `list` and the reset on the last
+          // closed GOAL keep working.
+          const cooldown = resolveCooldownMs(gf.nudgeEveryMs)
+          if (cooldown === null) continue
+          const waited = Date.now() - lastNudge
+          if (waited < cooldown) {
+            // Only a custom interval earns a log line; the ten-minute default
+            // stayed silent before and I keep it that way.
+            if (typeof gf.nudgeEveryMs === "number" && gf.nudgeEveryMs > 0) {
+              const waitMin = Math.max(1, Math.ceil((cooldown - waited) / 60000))
+              logSkipThrottled(sid, "interval", `[SKIP-INTERVAL] ${sid} next=+${waitMin}m`)
+            }
+            continue
+          }
           if (liveInFlight(sid) > 0 || hasLiveBusy(sid)) {
             logSkipThrottled(sid, "busy", `[SKIP-BUSY] ${sid} tool running`)
             continue
@@ -947,8 +1022,11 @@ async function checkLiveness(sessionID: string): Promise<Liveness> {
           }
           const stallNote = stalled.length > 0 ? `\nPossibly stalled children (no signal anywhere for 30+ min): ${stalled.slice(0, 5).join(", ")}.` : ""
           const moreNote = children.length > 20 ? `\nNote: ${children.length - 20} more registered children were not checked in this cycle.` : ""
+          // With a long custom interval the agent may think I died between two
+          // nudges, so I state the cadence when it is not the default.
+          const everyNote = typeof gf.nudgeEveryMs === "number" && gf.nudgeEveryMs > 0 ? `\nNudges in this session are throttled to one per ${formatEvery(gf.nudgeEveryMs)}.` : ""
           const lines = open.slice(0, 10).map((g, i) => `${i + 1}. [${g.id ?? "g"}] ${g.target}`).join("\n")
-          const text = `GOAL watchdog: open GOALs detected with no progress in parent or child sessions (${reason}). Main agent, keep going instead of waiting for a human.\nopen GOALs:\n${lines}${stallNote}${moreNote}\nIf any of the four stop conditions holds (done, need_human_decision, need_human_action, blocked), close the corresponding GOAL yourself right now with the goal tool: action done, the matching doneReason, and evidence for blocked. I never close GOALs on my own. Otherwise keep working and update pendingChildIDs with the goal tool.`
+          const text = `GOAL watchdog: open GOALs detected with no progress in parent or child sessions (${reason}). Main agent, keep going instead of waiting for a human.\nopen GOALs:\n${lines}${stallNote}${moreNote}${everyNote}\nIf any of the four stop conditions holds (done, need_human_decision, need_human_action, blocked), close the corresponding GOAL yourself right now with the goal tool: action done, the matching doneReason, and evidence for blocked. I never close GOALs on my own. Otherwise keep working and update pendingChildIDs with the goal tool.`
           try {
             await cx.session.prompt({ sessionID: sid, text })
             debugLogLine(`[NUDGE] ${sid} open=${open.length} reason=${reason}`)

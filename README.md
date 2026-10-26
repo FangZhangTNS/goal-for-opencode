@@ -1,6 +1,6 @@
 # goal-for-opencode
 
-Version: 1.0.5
+Version: 1.1.0
 Tested with: opencode v2.0.30 (V2 plugin API)
 Repository: https://github.com/FangZhangTNS/goal-for-opencode
 
@@ -9,8 +9,10 @@ GOALs and closes them itself; I only watch, and I never write a status. When
 a session with open GOALs stops making progress, I send one real prompt into
 that session. The prompt lands in the transcript as a user message, enters
 the model context, and is billed like any other prompt, so I cap it: at most
-one nudge per session per 10 minutes, and I give up after three nudges in a
-row that produce no agent activity. I do not expire open GOALs; an abandoned
+one nudge per session per 10 minutes by default. The agent can stretch that
+per session with `nudgeEvery` (1 minute to 24 hours), or switch it off for a
+wait that something outside me will end. I also give up after three nudges in
+a row that produce no agent activity. I do not expire open GOALs; an abandoned
 GOAL keeps being nudged until the agent closes it or I stop OpenCode.
 
 Why I use it: my long runs are mostly unattended. Two failures kept
@@ -48,8 +50,10 @@ none of my code is a shell command.
 
 ## Install
 
-1. Create `<config>/plugins/goal-for-opencode/` and copy `index.ts` into it.
-   I load as a single TypeScript file; there is no build step.
+1. Create `<config>/plugins/goal-for-opencode/` and copy `index.ts` and
+   `nudge.ts` into it. I load as two TypeScript files and there is no build
+   step; `nudge.ts` holds the duration parser, which I keep separate so it can
+   be tested without a host.
 2. Add this entry to `<config>/opencode.json`. If the key already exists,
    add my path to that list:
 
@@ -58,7 +62,7 @@ none of my code is a shell command.
 3. Restart every OpenCode process you use: the desktop app and any
    `opencode serve` or CLI service.
 4. Check `<config>/goal-for-opencode-debug.log`:
-   - `[INIT] goal-for-opencode v1.0.4 loaded` missing: I did not load.
+   - `[INIT] goal-for-opencode v1.1.0 loaded` missing: I did not load.
      Check the path, the file, and the V2 plugin API requirement above.
    - First line present but `[INIT] tool=goal registered` missing: I loaded
      but the tool registration failed. Look for a following `[INIT-FAIL]`
@@ -68,14 +72,17 @@ none of my code is a shell command.
      appears under `<config>/goal-for-opencode-sessions/`.
 
 I typecheck with my own `tsconfig.v2check.json`. I did not ship it, because
-installing me never touches it.
+installing me never touches it. `nudge.test.ts` does ship: `node --test
+nudge.test.ts` runs without any dependency, and it is the check I use before
+changing the throttle rules.
 
 ## Files
 
 I write these files under `<config>`:
 
 - `goal-for-opencode-sessions/<sessionID>.json` - one GOAL file per session:
-  target, doneCriteria, plan, status, doneReason, evidence.
+  target, doneCriteria, plan, status, doneReason, evidence, and the current
+  nudge throttle (`nudgeEveryMs`, `nudgeOffAt`).
 - `goal-for-opencode-debug.log` - append-only; I do not rotate it.
 - `goal-for-opencode-state/busy/` - one marker per running tool call.
 - `goal-for-opencode-state/<sessionID>.turnend` - last turn-end time.
@@ -110,14 +117,19 @@ that wants the nudges to stop can close a GOAL it did not finish.
 
 - I scan every 60 s per plugin instance, and at most once per 15 s across
   all instances.
-- I nudge at most once per session per 10 minutes.
+- I nudge at most once per session per 10 minutes by default. The agent can
+  stretch that for its session with `nudgeEvery` (1 minute to 24 hours) or
+  switch nudges off for that session; both live in the session GOAL file.
+- A throttle belongs to the open-GOAL period. When a session has no open GOAL
+  left, my next scan drops the override back to the default, so a later GOAL in
+  the same session cannot inherit an off switch.
 - I skip the nudge while a tool call is in flight, while a tool part or
   background shell still reports `running` and the newest message is less
   than 6 hours old.
 - I stop nudging a session after three nudges in a row that produce no agent
   activity at all: no reasoning, no tool call, no text. The count resets as
   soon as the agent produces anything.
-- I treat a session as active for 3 minutes after any tool call, and I give
+- I treat a session as active for 10 minutes after any tool call, and I give
   a subagent report 5 minutes of grace before the next nudge.
 - I report subagents quiet for 30 minutes as possibly stalled.
 - I check at most 20 child sessions and list 10 GOALs per cycle.
@@ -132,29 +144,51 @@ that wants the nudges to stop can close a GOAL it did not finish.
   then the child report scan) and once per registered child.
 - I cannot see an unsent draft, so a nudge can arrive while a human is
   typing.
-- All of these timings are constants in `index.ts`; I made none of them
-  configurable.
+- All of these timings are constants in `index.ts`, with one exception: the
+  per-session nudge interval, which the agent sets through the tool and which I
+  store in the session GOAL file.
 
 ## Tool
 
-I register `goal` as a host tool that the agent calls; I accept four actions:
+I register `goal` as a host tool that the agent calls; I accept five actions:
 
-- `create` + `target` (+ `doneCriteria`, + `plan`) - open a GOAL. `plan`
-  holds a short todo list of the concrete steps.
-- `list` - show open GOALs.
+- `create` + `target` (+ `doneCriteria`, + `plan`, + `nudgeEvery`) - open a
+  GOAL. `plan` holds a short todo list of the concrete steps.
+- `list` - show open GOALs and the current nudge throttle.
 - `done` + `id` + `doneReason` (+ `evidence` when `blocked`) - close a GOAL.
 - `set_children` + `pendingChildIDs` - replace outstanding child session
   IDs after dispatch or when I reap them.
+- `set_nudge` + `nudgeEvery` - change how often I may nudge this session.
 
-Example:
+`nudgeEvery` takes a duration (`30m`, `1h`, `1h30m`, `90s`, or a bare number of
+minutes), `off`, or `default`. The range is 1 minute to 24 hours. The value is
+per session, not per GOAL: the last call wins, and it lasts while at least one
+GOAL is open.
+
+Why it exists: a multi-hour transfer or build used to leave two bad options,
+one nudge every 10 minutes or closing the GOAL. Closing it throws away the
+tracking, and that is the wrong trade for a task that is still running. With
+`nudgeEvery: "2h"` the GOAL stays open and I only knock every two hours.
+
+`off` is different from closing the GOAL: the GOAL stays open, `list` keeps
+showing it as unfinished, and I keep maintaining its file. What changes is that
+nothing in this plugin will wake that session any more. Set it only when
+something outside me (a background process, a message, a polling loop) will
+bring the session back, because otherwise the GOAL sits there silently.
+
+Examples:
 
     goal({ action: "create", target: "Ship v1.2", doneCriteria: "tests green",
-           plan: "1. fix parser 2. run tests" })
-    -> GOAL g1 opened. 1 open in session ses_...
+           plan: "1. fix parser 2. run tests", nudgeEvery: "2h" })
+    -> GOAL g1 opened. 1 open in session ses_.... Nudges throttled to one per 2h.
 
     goal({ action: "list" })
-    -> [g1] Ship v1.2 (done when: tests green)
+    -> Nudges throttled to one per 2h.
+       [g1] Ship v1.2 (done when: tests green)
          plan: 1. fix parser 2. run tests
+
+    goal({ action: "set_nudge", nudgeEvery: "off" })
+    -> Nudges off for session ses_.... Nothing in this plugin will wake it.
 
     goal({ action: "done", id: "g1", doneReason: "done" })
     -> GOAL g1 closed (done). 0 open remaining.
@@ -203,12 +237,19 @@ them with the tool, or edit the session JSON by hand.
 - I store GOAL text and evidence as plain text, so anything I keep there is
   readable on disk; I would not put a secret in a GOAL.
 - My nudges are real prompts: each one is a user message, so the context is
-  re-sent and a full inference runs. I have no pause switch, so a GOAL left
-  open costs a turn every 10 minutes for as long as OpenCode stays up.
-- I did not add a pause command. Close the GOALs or uninstall me.
+  re-sent and a full inference runs. At the 10-minute default an open GOAL costs
+  a turn every 10 minutes for as long as OpenCode stays up; `nudgeEvery` is how
+  I keep that cost bounded on a long wait.
+- `off` is the only way to stop the nudges without closing the GOAL, and it is
+  a real silence: nothing in this plugin fires for that session until the
+  throttle is cleared, the session has no open GOAL left, or a human writes.
 
 ## Changes
 
+- 1.1.0 - added the per-session nudge interval: `nudgeEvery` on `create` and a
+  `set_nudge` action accept 1m..24h, `off`, or `default`. The interval is stored
+  in the session GOAL file, shown by `list`, and dropped when the session has no
+  open GOAL left. The duration parser lives in `nudge.ts` with `nudge.test.ts`.
 - 1.0.5 - I stop after three unanswered nudges so a wedged session cannot be
   spammed; added LICENSE and a repository link.
 - 1.0.4 - renamed everything from goal-watch to goal-for-opencode, including
