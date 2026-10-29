@@ -26,7 +26,7 @@ import { join } from "node:path"
 // Free-form fields (target, doneCriteria, plan, evidence) accept any language;
 // I keep the tool definition itself English-only.
 
-const VERSION = "1.1.0"
+const VERSION = "1.2.0"
 const LOG = "goal-for-opencode-debug.log"
 const SESSIONS_DIRNAME = "goal-for-opencode-sessions"
 const SCAN_INTERVAL_MS = 60000
@@ -423,17 +423,53 @@ function hasRunningTool(msgs: unknown, n: number): boolean {
   return false
 }
 
-// V2 exposes long-lived shell jobs as their own message type. While one is
-// running I treat the session as waiting, not idle.
-function hasRunningShell(msgs: unknown, n: number): boolean {
-  for (const m of toArray(msgs).slice(-n)) {
+// A backgrounded command is not stored as a `shell` message in this build: the
+// shell tool returns status "completed" right away and leaves the job state in
+// state.metadata ({status:"running", shellID:"sh_..."}), while the host appends
+// a completion notice carrying {source:"shell", shellID, state} when the job
+// ends and wakes the session on its own. I pair the two, so a pending job reads
+// as waiting instead of idle. Reading only state.status made every background
+// wait look idle and the watchdog nudged sessions the host was already going to
+// resume.
+//
+// I match the completion notice on its payload, not on the message `type`: the
+// stored row keeps the type outside the payload, and the pairing must survive
+// both shapes. `state` is the tell, because the start marker uses `status`.
+//
+// Exported so a check can replay real transcripts against the detection; the
+// plugin loader only uses the default export.
+export function liveBackgroundShells(msgs: unknown, maxAgeMs: number, now = Date.now()): string[] {
+  const startedAt = new Map<string, number>()
+  const finished = new Set<string>()
+  for (const m of toArray(msgs)) {
     const o = m as Record<string, unknown> | null
     if (!o || typeof o !== "object") continue
-    if (o["type"] !== "shell") continue
-    const st = o["status"]
-    if (st === "running" || st === "streaming" || st === "started") return true
+    const meta = o["metadata"] as Record<string, unknown> | null
+    if (meta && typeof meta["shellID"] === "string" && meta["shellID"] && typeof meta["state"] === "string") {
+      finished.add(meta["shellID"] as string)
+      continue
+    }
+    for (const p of msgParts(m)) {
+      const po = p as Record<string, unknown> | null
+      if (!po || typeof po !== "object") continue
+      if (po["type"] !== "tool" || po["name"] !== "shell") continue
+      const st = po["state"] as Record<string, unknown> | null
+      const pm = st?.["metadata"] as Record<string, unknown> | null
+      if (!pm || pm["status"] !== "running") continue
+      const id = pm["shellID"]
+      if (typeof id !== "string" || !id) continue
+      // A job whose completion notice never landed must age out like any other
+      // stale marker, so I keep the start time and let the caller cap it.
+      if (!startedAt.has(id)) startedAt.set(id, messageTime(m) || now)
+    }
   }
-  return false
+  const live: string[] = []
+  for (const [id, at] of startedAt) {
+    if (finished.has(id)) continue
+    if (now - at > maxAgeMs) continue
+    live.push(id)
+  }
+  return live
 }
 
 function lastUserText(msgs: unknown): string {
@@ -833,7 +869,7 @@ async function checkLiveness(sessionID: string): Promise<Liveness> {
   // A part or shell job still reporting "running" keeps the session active
   // for me. The cap is deliberate: a part wedged at "running" forever must not
   // lock the session, but multi-hour builds and polling waits stay covered.
-  if (newest > 0 && Date.now() - newest < RUNNING_PART_MAX_MS && (hasRunningTool(msgs, RECENT_WINDOW) || hasRunningShell(msgs, RECENT_WINDOW))) return { state: "active", newest }
+  if (newest > 0 && Date.now() - newest < RUNNING_PART_MAX_MS && (hasRunningTool(msgs, RECENT_WINDOW) || liveBackgroundShells(msgs, RUNNING_PART_MAX_MS).length > 0)) return { state: "active", newest }
   if (newest > 0 && Date.now() - newest < ACTIVE_WINDOW_MS) return { state: "active", newest }
   // A user message only means "the human's turn" to me while it is the newest
   // message and only for a bounded window. An answered task message several

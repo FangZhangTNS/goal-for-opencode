@@ -1,6 +1,6 @@
 # goal-for-opencode
 
-Version: 1.1.0
+Version: 1.2.0
 Tested with: opencode v2.0.30 (V2 plugin API)
 Repository: https://github.com/FangZhangTNS/goal-for-opencode
 
@@ -28,8 +28,10 @@ works unless the agent created a GOAL; I never open one myself.
 
 If a tool call is still running I stay out on purpose: its return already
 wakes the agent, and a nudge in the middle of a long shell only adds noise.
-When a call hangs, I stay out until the running mark ages out; I step in
-when the session is quiet and nothing is running.
+A command the host moved to the background counts as still running: its
+completion notice wakes the agent too. When a call hangs, I stay out until the
+running mark ages out; I step in when the session is quiet and nothing is
+running.
 
 ## Requirements
 
@@ -62,7 +64,7 @@ none of my code is a shell command.
 3. Restart every OpenCode process you use: the desktop app and any
    `opencode serve` or CLI service.
 4. Check `<config>/goal-for-opencode-debug.log`:
-   - `[INIT] goal-for-opencode v1.1.0 loaded` missing: I did not load.
+   - `[INIT] goal-for-opencode v1.2.0 loaded` missing: I did not load.
      Check the path, the file, and the V2 plugin API requirement above.
    - First line present but `[INIT] tool=goal registered` missing: I loaded
      but the tool registration failed. Look for a following `[INIT-FAIL]`
@@ -123,9 +125,14 @@ that wants the nudges to stop can close a GOAL it did not finish.
 - A throttle belongs to the open-GOAL period. When a session has no open GOAL
   left, my next scan drops the override back to the default, so a later GOAL in
   the same session cannot inherit an off switch.
-- I skip the nudge while a tool call is in flight, while a tool part or
-  background shell still reports `running` and the newest message is less
-  than 6 hours old.
+- I skip the nudge while a tool call is in flight, and while a tool part is
+  still `running` or a background shell job is still pending and the newest
+  message is less than 6 hours old. A backgrounded command is not stored as a
+  `shell` message in the build I test: the shell tool returns `completed` at
+  once and keeps the job in `state.metadata` (`status: "running"`, `shellID`),
+  and the host appends a completion notice carrying the same `shellID` when the
+  job ends. I pair the two, so a pending job reads as waiting, not idle. The
+  6-hour cap covers a job whose completion notice never arrives.
 - I stop nudging a session after three nudges in a row that produce no agent
   activity at all: no reasoning, no tool call, no text. The count resets as
   soon as the agent produces anything.
@@ -246,6 +253,15 @@ them with the tool, or edit the session JSON by hand.
 
 ## Changes
 
+- 1.2.0 - fixed the false nudges during background shell waits. I no longer
+  look for a `shell` message, which this build never writes: I read the job from
+  the shell tool part's `state.metadata` and cancel it with the completion
+  notice that carries the same `shellID`. Without this, a session that was
+  asleep on a backgrounded command looked idle and got nudged. Checked against a
+  45-minute polling transcript with six nudges that should not have fired, and
+  with a live pair in one session: a 15-minute background wait produced no
+  nudge, while the same session left idle with no shell produced one
+  immediately after its 10-minute active window.
 - 1.1.0 - added the per-session nudge interval: `nudgeEvery` on `create` and a
   `set_nudge` action accept 1m..24h, `off`, or `default`. The interval is stored
   in the session GOAL file, shown by `list`, and dropped when the session has no
